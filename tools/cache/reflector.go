@@ -43,8 +43,10 @@ import (
 	"k8s.io/utils/trace"
 )
 
-const defaultExpectedTypeName = "<unspecified>"
-
+const (
+	defaultExpectedTypeName = "<unspecified>"
+	maxClientTimeout = time.Hour
+)
 // Reflector watches a specified resource and causes all changes to be reflected in the given store.
 type Reflector struct {
 	// name identifies this reflector. By default it will be a file:line if possible.
@@ -426,7 +428,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			return err
 		}
 
-		if err := r.watchHandler(start, w, &resourceVersion, resyncerrc, stopCh); err != nil {
+		if err := r.watchHandler(start, w, &resourceVersion, resyncerrc, options.TimeoutSeconds, stopCh); err != nil {
 			if err != errorStopRequested {
 				switch {
 				case isExpiredError(err):
@@ -457,16 +459,32 @@ func (r *Reflector) syncWith(items []runtime.Object, resourceVersion string) err
 }
 
 // watchHandler watches w and keeps *resourceVersion up to date.
-func (r *Reflector) watchHandler(start time.Time, w watch.Interface, resourceVersion *string, errc chan error, stopCh <-chan struct{}) error {
+func (r *Reflector) watchHandler(start time.Time, w watch.Interface, resourceVersion *string, errc chan error, timeoutSeconds *int64, stopCh <-chan struct{}) error {
 	eventCount := 0
 
 	// Stopping the watcher should be idempotent and if we return from this function there's no way
 	// we're coming back in with the same watch interface.
 	defer w.Stop()
 
+	// Timeout for client wait watcher no response. Fix #107266
+	var timeoutClient time.Duration
+
+	if timeoutSeconds != nil {
+		timeoutClient = time.Duration(*timeoutSeconds) * time.Second + time.Minute
+	} else {
+		timeoutClient = maxClientTimeout
+	}
+	timeout := time.NewTicker(timeoutClient)
+	defer timeout.Stop()
+
 loop:
 	for {
 		select {
+		case <-timeout.C:
+			if eventCount == 0 {
+				return fmt.Errorf("long time wait watch: %s: Unexpected watch wait - watch lasted more than client timeout %s and no items received", r.name, timeoutClient)
+			}
+			continue
 		case <-stopCh:
 			return errorStopRequested
 		case err := <-errc:
